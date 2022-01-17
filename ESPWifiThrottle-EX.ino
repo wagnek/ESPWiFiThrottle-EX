@@ -1,25 +1,45 @@
 #include <ESP8266WiFi.h>
+#include <Wire.h>     // for I2C 
+#include <LCD_I2C.h>  // for LCD
+#include <PCF8574.h>  // for PCF8574 I/O board
 
-const char* ssid = "wifi-network-name";
-const char* password = "wifi-netowrk-password";
-
-// CommandStation-EX connection details.
-byte ip[] = { 192, 168, 0, 181 };
-int port = 2560;
+#include "Encoder.h"
 
 // Rotary encoder inputs.
 #define CLK 13
 #define DT 12
-#define SW 2
+#define SW 14
+
+// Pinout for I/O expander board.
+#define PFC_ESTOP_PIN 0
+#define PFC_FUNC_LIGHT_PIN 1
+#define PFC_FUNC_BELL_PIN 2
+#define PFC_FUNC_HORN_PIN 3
+#define PFC_FWD_PIN 4
+#define PFC_REV_PIN 5
+
+// Wifi network details.
+const char* ssid = "wifi-network-name";
+const char* password = "wifi-netowrk-password";
+
+// CommandStation-EX connection details.
+byte ip[] = { 192, 168, 0, 180 };
+int port = 2560;
 
 WiFiClient client;
 
-// State variables for rotary encoder.
-int counter = 0;
-int currentStateCLK;
-int lastStateCLK;
-String currentDir = "";
-unsigned long lastButtonPress = 0;
+LCD_I2C lcd = LCD_I2C(0x27, 16, 2);
+
+PCF8574 pfc = PCF8574();
+
+Encoder encoder( CLK, DT, SW );
+
+int cab_number[4] = { 7036, 6792, 333, 339 };
+int cab_speed[4] = { 0, 0 };
+int cab_direction[4] = { 1, 1 };
+int cab_f0[4] = { 0, 0 };
+
+int cab_idx = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -27,26 +47,56 @@ void setup() {
   }
   delay(1000);
 
-  Serial.println("Startup." );
+  lcd.begin();
+  lcd.backlight();
+  
+  lcd.setCursor(0, 0);
+  Serial.println("Initializing... " );
+  lcd.print("Initializing... ");
+
+  Serial.println("PFC I/O Board..." );
+  lcd.setCursor(0, 1); lcd.print("PFC I/O Board...");
+
+  if (!pfc.begin())
+  {
+    Serial.println("pfc not initialized");
+  }
+  if (!pfc.isConnected())
+  {
+    Serial.println("pfc not connected");
+    while (1);
+  }
+
+  Serial.println("Rotary Encoder.." );
+  lcd.setCursor(0, 1); lcd.print("Rotary Encoder..");
+
+  encoder.init();
+
+  Serial.println("Wifi...         " );
+  lcd.setCursor(0, 1); lcd.print("Wifi...         ");
 
   initWiFi();
-
-  // Pins for the rotary encoder.
-  pinMode(CLK, INPUT);
-  pinMode(DT, INPUT);
-  pinMode(SW, INPUT_PULLUP);
-
-  // Read the initial state of CLK
-  lastStateCLK = digitalRead(CLK);
 }
 
-int flip = 0;
+#define PFC_TRUE 0
+#define PFC_FALSE 1
+
+uint8_t last_estop_state = PFC_FALSE;
+uint8_t last_f0_state = PFC_FALSE;
+uint8_t last_fwd_state = PFC_FALSE;
+uint8_t last_rev_state = PFC_FALSE;
+uint8_t last_brk_state = PFC_FALSE;
+
+unsigned long last_brk_time = 0;
+
+int last_encoder_bt_state = 0;
 
 void loop() {
   // if the client is no longer connected, the stop the client and reconnect.
   if ( !client.connected() ) {
     client.stop();
-    Serial.print("Connecting to CommandStation-DX...");
+    Serial.print("Connect to DCC-DX...");
+    lcd.setCursor(0, 1); lcd.print("Connect DCC-EX..");
     if ( client.connect( ip, port ) ) {
       client.setNoDelay(true);
       Serial.println("Connected.");
@@ -57,70 +107,109 @@ void loop() {
     // Serial.println("Connected to CommandStation-DX.");
   }
 
-  // Handled the rotary encoder.
-  // Read the current state of CLK
-  currentStateCLK = digitalRead(CLK);
+  //
+  // Check inputs
+  //
+  int b_buff = 0;
+  String clientCommand = "";
 
-  // If last and current state of CLK are different, then pulse occurred
-  // React to only 1 state change to avoid double count
-  if (currentStateCLK != lastStateCLK  && currentStateCLK == 1) {
-
-    // If the DT state is different than the CLK state then
-    // the encoder is rotating CCW so decrement
-    if (digitalRead(DT) != currentStateCLK) {
-      counter ++;
-      currentDir = "CCW";
-    } else {
-      // Encoder is rotating CW so increment
-      counter --;
-      currentDir = "CW";
+  // Emergency stop
+  b_buff = pfc.read(PFC_ESTOP_PIN);
+  if (b_buff == 0 && b_buff != last_estop_state) {
+    clientCommand = "<!>";
+    Serial.println(clientCommand);
+    client.println(clientCommand);
+    encoder.write( 0 );
+    int len = (sizeof(cab_speed) / sizeof(cab_speed[0])) - 1;
+    for (int i=0; i<len; i++) {
+      cab_speed[i] = 0;
     }
+    lcd.setCursor(0, 1); lcd.print("Emergency Stop! ");
+  }
+  last_estop_state = b_buff;
 
-    // Proof of concept. Prove that we can send a throttle command message
-    // to the CommandStation-DX and that locomotive 7036 will respond.
-    String s = "<t 0 7036 ";    // address loco #7036
-    s.concat( abs( counter ) ); // loco speed
-    s.concat( " " );
-    if ( counter >= 0 ) { // loco direction
-      s.concat( 1 );      // forward
-    } else {
-      s.concat( 0 );      // reverse
-    }
-    s.concat( ">" );
-    Serial.println(s);
-    client.println(s);
+
+  // F0 Headlight
+  b_buff = pfc.read(PFC_FUNC_LIGHT_PIN);
+  if (b_buff == 0 && b_buff != last_f0_state) {
+    cab_f0[cab_idx] = !cab_f0[cab_idx];
+    clientCommand = "<F ";
+    clientCommand.concat(cab_number[cab_idx]);
+    clientCommand.concat(" 0 ");
+    clientCommand.concat(cab_f0[cab_idx]);
+    clientCommand.concat(">");
+    Serial.println(clientCommand);
+    client.println(clientCommand);
+    lcd.setCursor(0, 1); lcd.print("Light ON/OFF    ");
+  }
+  last_f0_state = b_buff;
+
+  // Direction
+  // Forward
+  b_buff = pfc.read(PFC_FWD_PIN);
+  if (b_buff == 0 && b_buff != last_fwd_state) {
+    last_brk_state = PFC_FALSE;
+    cab_direction[cab_idx] = 1;
+    Serial.println("Forward!");
+    txThrottleCommand();
+    lcd.setCursor(0, 1); lcd.print("Forward!        ");
+  }
+  last_fwd_state = b_buff;
+
+  // Direction
+  // Reverse
+  b_buff = pfc.read(PFC_REV_PIN);
+  if (b_buff == 0 && b_buff != last_rev_state) {
+    last_brk_state = PFC_FALSE;
+    cab_direction[cab_idx] = 0;
+    Serial.println("Reverse!");
+    txThrottleCommand();
+    lcd.setCursor(0, 1); lcd.print("Reverse!        ");
+  }
+  last_rev_state = b_buff;
+
+  // Direction
+  // Brake
+  if ( last_fwd_state == PFC_FALSE && last_rev_state == PFC_FALSE && cab_speed[cab_idx] > 0 && millis() - last_brk_time > 250 ) {
+    Serial.println("Brake!");
+    last_brk_time = millis();
+    // BRAKING CYCLE Incremental decrease throttle to zero.
+    // To Do: Prevent change of direction until breaking cycle is complete.
+    cab_speed[cab_idx] = cab_speed[cab_idx] - 1;
+    encoder.write( cab_speed[cab_idx] );
+    txThrottleCommand();
+    lcd.setCursor(0, 1); lcd.print("Braking!        ");
   }
 
-  // Remember last CLK state
-  lastStateCLK = currentStateCLK;
+  // Throttle Mode
+  // Encoder rotation
+  encoder.loop();
+  b_buff = encoder.read();
+  if ( b_buff != cab_speed[cab_idx] ) {
+    cab_speed[cab_idx] = b_buff;
+    if (b_buff < 0) {
+      encoder.write( 0 );
+      cab_speed[cab_idx] = 0;
+    }
+    if (b_buff > 28) {
+      encoder.write( 28 );
+      cab_speed[cab_idx] = 28;
+    }
+    txThrottleCommand();
+  }
 
+  // Encoder click
   // Read the button state
-  int btnState = digitalRead(SW);
-
-  //If we detect LOW signal, button is pressed
-  if (btnState == LOW) {
-    //if 50ms have passed since last LOW pulse, it means that the
-    //button has been pressed, released and pressed again
-    if (millis() - lastButtonPress > 50) {
-
-      // Proof of concept. Prove that we can send a throttle command message
-      // to the CommandStation-DX and that turns track power on and off.
-      Serial.println("Click!");
-      if ( flip == 0 ) {
-        client.println("<1 MAIN>");
-        flip = 1;
-      } else {
-        client.println("<0 MAIN>");
-        flip = 0;
-      }
-    }
-
-    // Remember last button press event
-    lastButtonPress = millis();
+  b_buff = digitalRead(SW);
+  if (b_buff == LOW && b_buff != last_encoder_bt_state ) {
+    clientCommand = "<1 MAIN>";
+    Serial.println(clientCommand);
+    client.println(clientCommand);
+    lcd.setCursor(0, 1); lcd.print("Track Power ON  ");
   }
+  last_encoder_bt_state = b_buff;
 
-  // Put in a slight delay to help debounce the readings
-  delay(1);
+  // Menu Mode
 
   // if there's a response from the service, read and print it out.
   while ( client.available() ) {
@@ -129,11 +218,25 @@ void loop() {
   }
 }
 
+void txThrottleCommand() {
+  String clientCommand = "";
+  clientCommand = "<t 1 ";
+  clientCommand.concat(cab_number[cab_idx]);
+  clientCommand.concat(" ");
+  clientCommand.concat(cab_speed[cab_idx]);
+  clientCommand.concat(" ");
+  clientCommand.concat(cab_direction[cab_idx]);
+  clientCommand.concat(">");
+  Serial.println(clientCommand);
+  client.println(clientCommand);
+  lcd.setCursor(0, 0); lcd.print(clientCommand);
+}
+
 void initWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
 
-  Serial.print("Connecting to WiFi." );
+  Serial.print("Connect to WiFi..." );
 
   while ( WiFi.status() != WL_CONNECTED ) {
     Serial.print(".");
